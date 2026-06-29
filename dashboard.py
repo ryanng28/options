@@ -27,6 +27,35 @@ DB_PATH = Path(__file__).parent / "options_history.db"
 st.set_page_config(page_title="Options Chain Tracker", layout="wide")
 
 
+def check_password() -> bool:
+    """Simple password gate for when this is deployed publicly. If no
+    DASHBOARD_PASSWORD secret is configured (e.g. running locally), this
+    is skipped entirely and the app behaves as before."""
+    try:
+        required_password = st.secrets.get("DASHBOARD_PASSWORD")
+    except Exception:
+        required_password = None
+
+    if not required_password:
+        return True  # no password configured (local use) — allow through
+
+    if st.session_state.get("password_correct", False):
+        return True
+
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if pw == required_password:
+            st.session_state["password_correct"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password")
+    return False
+
+
+if not check_password():
+    st.stop()
+
+
 @st.cache_data(ttl=60)
 def get_symbols() -> list[str]:
     if not DB_PATH.exists():
