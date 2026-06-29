@@ -115,6 +115,14 @@ num_expirations_to_fetch = st.slider(
     help="More expirations = more data pulled per fetch, takes longer.",
 )
 
+auto_refresh = st.toggle(
+    "🔄 Live auto-refresh (every 30s while market is open)",
+    value=False,
+    help="When on, automatically re-fetches the current ticker's chain every "
+         "30 seconds and reloads the page. Leave off to only refresh "
+         "manually with the Fetch button.",
+)
+
 if fetch_clicked and search_ticker:
     with st.spinner(f"Fetching chain for {search_ticker}..."):
         try:
@@ -146,6 +154,30 @@ else:
     st.stop()
 
 st.session_state["current_symbol"] = symbol
+
+if auto_refresh:
+    # Re-fetch the current symbol automatically, throttled to once per 30s
+    # via caching (so a page full of viewers doesn't hammer Questrade —
+    # everyone shares the same cached pull within that window).
+    @st.cache_data(ttl=30)
+    def auto_fetch_chain(sym: str, n_exp: int):
+        from qt_chain import get_full_chain
+        from qt_db import init_db, save_snapshot
+
+        fresh_df = get_full_chain(sym, num_expirations=n_exp)
+        init_db()
+        save_snapshot(fresh_df, symbol=sym)
+        return len(fresh_df)
+
+    try:
+        rows_saved = auto_fetch_chain(symbol, num_expirations_to_fetch)
+        st.caption(f"🔄 Live auto-refresh on — last pull: {rows_saved} contracts for {symbol}")
+    except Exception as e:
+        st.caption(f"⚠️ Auto-refresh failed: {e}")
+
+    # Forces the browser to reload the whole page every 30s, which re-runs
+    # this script and (via the cache above) checks for fresh data.
+    st.markdown('<meta http-equiv="refresh" content="30">', unsafe_allow_html=True)
 
 # Spot price for the underlying, shown next to the chain
 @st.cache_data(ttl=60)
@@ -204,11 +236,22 @@ st.caption(
 
 st.caption("Filter strikes")
 all_strikes = sorted(df_side["strike"].unique())
-strikes_with_volume = sorted(df_side[df_side["volume"] > 0]["strike"].unique())
-if strikes_with_volume:
-    default_lo, default_hi = strikes_with_volume[0], strikes_with_volume[-1]
+
+if spot_price:
+    # Default to within 30% of the current spot price — keeps the heatmap
+    # focused on strikes that are actually relevant to where the stock is
+    # trading right now, instead of showing the full chain including far
+    # OTM strikes nobody's looking at.
+    target_lo = spot_price * 0.7
+    target_hi = spot_price * 1.3
+    default_lo = max(all_strikes[0], min(s for s in all_strikes if s >= target_lo) if any(s >= target_lo for s in all_strikes) else all_strikes[0])
+    default_hi = min(all_strikes[-1], max(s for s in all_strikes if s <= target_hi) if any(s <= target_hi for s in all_strikes) else all_strikes[-1])
 else:
-    default_lo, default_hi = all_strikes[0], all_strikes[-1]
+    strikes_with_volume = sorted(df_side[df_side["volume"] > 0]["strike"].unique())
+    if strikes_with_volume:
+        default_lo, default_hi = strikes_with_volume[0], strikes_with_volume[-1]
+    else:
+        default_lo, default_hi = all_strikes[0], all_strikes[-1]
 
 strike_range = st.slider(
     "Strike price range",
@@ -216,6 +259,7 @@ strike_range = st.slider(
     max_value=float(all_strikes[-1]),
     value=(float(default_lo), float(default_hi)),
     label_visibility="collapsed",
+    help="Defaults to ±30% of current spot price.",
 )
 
 def format_compact(v) -> str:
