@@ -1,0 +1,449 @@
+"""
+Options chain dashboard — reads from the local SQLite history built up by
+qt_chain.py / watchlist_snapshot.py and shows:
+  - A strike x expiration volume heatmap (calls and puts)
+  - A max-volume-per-expiration summary table
+  side by side, for whichever symbol + snapshot you pick.
+
+Run with:
+    streamlit run dashboard.py
+
+Opens automatically in your browser, usually at http://localhost:8501
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+from qt_chain import max_volume_per_expiry
+
+DB_PATH = Path(__file__).parent / "options_history.db"
+
+st.set_page_config(page_title="Options Chain Tracker", layout="wide")
+
+
+@st.cache_data(ttl=60)
+def get_symbols() -> list[str]:
+    if not DB_PATH.exists():
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    symbols = pd.read_sql_query(
+        "SELECT DISTINCT symbol FROM snapshots ORDER BY symbol", conn
+    )["symbol"].tolist()
+    conn.close()
+    return symbols
+
+
+@st.cache_data(ttl=60)
+def get_snapshot_times(symbol: str) -> list[str]:
+    conn = sqlite3.connect(DB_PATH)
+    times = pd.read_sql_query(
+        "SELECT DISTINCT snapshot_time FROM snapshots WHERE symbol = ? "
+        "ORDER BY snapshot_time DESC",
+        conn, params=[symbol],
+    )["snapshot_time"].tolist()
+    conn.close()
+    return times
+
+
+@st.cache_data(ttl=60)
+def load_snapshot(symbol: str, snapshot_time: str) -> pd.DataFrame:
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT * FROM snapshots WHERE symbol = ? AND snapshot_time = ?",
+        conn, params=[symbol, snapshot_time],
+    )
+    conn.close()
+    return df
+
+
+st.title("📊 Options Chain Tracker")
+
+symbols = get_symbols()
+
+st.subheader("Ticker")
+search_col1, search_col2 = st.columns([3, 1])
+with search_col1:
+    default_symbol = st.session_state.get("current_symbol", symbols[0] if symbols else "")
+    search_ticker = st.text_input(
+        "Type a ticker symbol (e.g. TSLA, MSFT, NVDA) — press Enter to view, "
+        "or click Fetch to pull fresh live data",
+        value=default_symbol,
+        placeholder="Enter ticker...",
+    ).strip().upper()
+with search_col2:
+    st.write("")  # vertical spacer to align button with text input
+    fetch_clicked = st.button("Fetch live chain", use_container_width=True)
+
+num_expirations_to_fetch = st.slider(
+    "Number of upcoming expirations to fetch",
+    min_value=2, max_value=20, value=12,
+    help="More expirations = more data pulled per fetch, takes longer.",
+)
+
+if fetch_clicked and search_ticker:
+    with st.spinner(f"Fetching chain for {search_ticker}..."):
+        try:
+            from qt_chain import get_full_chain
+            from qt_db import init_db, save_snapshot
+
+            new_df = get_full_chain(search_ticker, num_expirations=num_expirations_to_fetch)
+            init_db()
+            save_snapshot(new_df, symbol=search_ticker)
+            st.success(f"Fetched and saved {len(new_df)} contracts for {search_ticker}.")
+            st.cache_data.clear()  # refresh symbol/snapshot lists so it shows up below
+            symbols = get_symbols()
+        except Exception as e:
+            st.error(f"Couldn't fetch {search_ticker}: {e}")
+
+if not symbols:
+    st.warning(
+        "No data yet. Search a ticker above and click Fetch, or run "
+        "`python3 watchlist_snapshot.py` to populate your watchlist."
+    )
+    st.stop()
+
+if search_ticker and search_ticker in symbols:
+    symbol = search_ticker
+elif symbols:
+    symbol = symbols[0]
+else:
+    st.warning(f"No saved data for '{search_ticker}' yet — click Fetch live chain to pull it.")
+    st.stop()
+
+st.session_state["current_symbol"] = symbol
+
+# Spot price for the underlying, shown next to the chain
+@st.cache_data(ttl=60)
+def get_cached_spot_price(sym: str):
+    try:
+        from qt_chain import get_spot_price
+        return get_spot_price(sym)
+    except Exception:
+        return None
+
+spot_price = get_cached_spot_price(symbol)
+if spot_price:
+    st.metric(f"{symbol} spot price", f"${spot_price:,.2f}")
+
+times = get_snapshot_times(symbol)
+snapshot_time = st.selectbox(
+    "Snapshot (most recent first)", times,
+    format_func=lambda t: t.replace("T", " ").split(".")[0] + " UTC",
+)
+
+df = load_snapshot(symbol, snapshot_time)
+
+if df.empty:
+    st.warning("No data for this selection.")
+    st.stop()
+
+_, label_col1, toggle_col, label_col2, _ = st.columns([4, 1, 1, 1, 4])
+with label_col1:
+    st.markdown(
+        "<div style='text-align:right; padding-top:14px; font-weight:800; "
+        "font-size:22px; color:#26a69a; white-space:nowrap;'>CALL</div>",
+        unsafe_allow_html=True,
+    )
+with toggle_col:
+    st.markdown(
+        "<div style='transform:scale(1.6); transform-origin:center; "
+        "display:flex; justify-content:center; padding-top:6px;'>",
+        unsafe_allow_html=True,
+    )
+    is_put = st.toggle(" ", value=False, label_visibility="collapsed")
+    st.markdown("</div>", unsafe_allow_html=True)
+with label_col2:
+    st.markdown(
+        "<div style='text-align:left; padding-top:14px; font-weight:800; "
+        "font-size:22px; color:#ef5350; white-space:nowrap;'>PUT</div>",
+        unsafe_allow_html=True,
+    )
+option_side = "put" if is_put else "call"
+df_side = df[df["type"] == option_side]
+
+st.caption(
+    f"{len(df)} total contracts in this snapshot · "
+    f"{df['expiration'].nunique()} expirations · "
+    f"taken {snapshot_time.replace('T', ' ').split('.')[0]} UTC"
+)
+
+st.caption("Filter strikes")
+all_strikes = sorted(df_side["strike"].unique())
+strikes_with_volume = sorted(df_side[df_side["volume"] > 0]["strike"].unique())
+if strikes_with_volume:
+    default_lo, default_hi = strikes_with_volume[0], strikes_with_volume[-1]
+else:
+    default_lo, default_hi = all_strikes[0], all_strikes[-1]
+
+strike_range = st.slider(
+    "Strike price range",
+    min_value=float(all_strikes[0]),
+    max_value=float(all_strikes[-1]),
+    value=(float(default_lo), float(default_hi)),
+    label_visibility="collapsed",
+)
+
+def format_compact(v) -> str:
+    if pd.isna(v):
+        return ""
+    v = float(v)
+    if v >= 1_000_000:
+        return f"{v/1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{v/1_000:.1f}K"
+    return f"{v:.0f}"
+
+
+def value_to_color(norm: float) -> str:
+    """Dark purple (low) -> purple (mid) -> gold (high), matching the
+    Obsidian-style gradient. norm is 0-1."""
+    norm = max(0.0, min(1.0, norm))
+    dark = (21, 16, 31)
+    mid = (91, 58, 160)
+    gold = (245, 180, 66)
+    if norm < 0.5:
+        t = norm / 0.5
+        c1, c2 = dark, mid
+    else:
+        t = (norm - 0.5) / 0.5
+        c1, c2 = mid, gold
+    r = int(c1[0] + (c2[0] - c1[0]) * t)
+    g = int(c1[1] + (c2[1] - c1[1]) * t)
+    b = int(c1[2] + (c2[2] - c1[2]) * t)
+    return f"rgb({r},{g},{b})"
+
+
+tab_heatmap, tab_chart, tab_data = st.tabs(["📊 Heatmap", "📈 Chart", "🗂️ Data"])
+
+with tab_heatmap:
+    st.subheader(f"Volume heatmap — {symbol} {option_side}s")
+
+    df_filtered = df_side[
+        (df_side["strike"] >= strike_range[0]) & (df_side["strike"] <= strike_range[1])
+    ]
+
+    pivot = df_filtered.pivot_table(
+        index="strike", columns="expiration", values="volume", aggfunc="sum"
+    ).sort_index(ascending=False)
+
+    max_val = pivot.max().max()
+    max_val = max_val if max_val and max_val > 0 else 1
+    # Square-root normalization spreads out the lower values more, similar to
+    # how the reference heatmap visually distinguishes mid-volume cells instead
+    # of everything below the single max looking equally dark.
+    norm_pivot = (pivot / max_val).pow(0.5)
+
+    strikes_sorted = list(pivot.index)  # already descending
+    expiries = list(pivot.columns)
+
+    rows_html = []
+    spot_marker_inserted = (spot_price is None)
+
+    for strike in strikes_sorted:
+        if not spot_marker_inserted and strike < spot_price:
+            spot_marker_inserted = True
+            n_cols = len(expiries)
+            rows_html.append(
+                f'<tr class="spot-row"><td class="spot-label">SPOT {spot_price:,.2f}</td>'
+                f'<td colspan="{n_cols}" class="spot-line"></td></tr>'
+            )
+
+        cells = [f'<td class="strike-label">{strike:g}</td>']
+        for exp in expiries:
+            val = pivot.loc[strike, exp]
+            norm = norm_pivot.loc[strike, exp]
+            if pd.isna(val):
+                cells.append('<td class="cell empty"></td>')
+            else:
+                color = value_to_color(norm)
+                text = format_compact(val)
+                cells.append(
+                    f'<td class="cell"><div class="pill" style="background:{color}">{text}</div></td>'
+                )
+        rows_html.append(f"<tr>{''.join(cells)}</tr>")
+
+    header_cells = "".join(f'<th class="exp-header">{exp}</th>' for exp in expiries)
+
+    heatmap_html = f"""
+    <style>
+    .heatmap-wrap {{
+        background:#1a1a1a;
+        border-radius:8px;
+        padding:12px;
+        overflow-x:auto;
+    }}
+    .heatmap-table {{
+        border-collapse:separate;
+        border-spacing:4px;
+        width:100%;
+        font-family:monospace;
+    }}
+    .exp-header {{
+        color:#aaa;
+        font-size:12px;
+        font-weight:600;
+        text-align:center;
+        padding:4px 8px;
+        white-space:nowrap;
+    }}
+    .strike-label {{
+        color:#ccc;
+        font-size:13px;
+        text-align:right;
+        padding-right:10px;
+        white-space:nowrap;
+    }}
+    .cell {{
+        text-align:center;
+        padding:0;
+    }}
+    .pill {{
+        border-radius:6px;
+        padding:8px 10px;
+        color:white;
+        font-weight:700;
+        font-size:13px;
+        text-align:center;
+        white-space:nowrap;
+    }}
+    .spot-row td {{
+        padding:2px 0;
+    }}
+    .spot-label {{
+        color:#1a1a1a;
+        background:#fff;
+        font-size:11px;
+        font-weight:700;
+        text-align:right;
+        padding:2px 8px;
+        border-radius:4px;
+        white-space:nowrap;
+    }}
+    .spot-line {{
+        border-top:2px dashed #f0d060;
+    }}
+    </style>
+    <div class="heatmap-wrap">
+    <table class="heatmap-table">
+    <tr><th></th>{header_cells}</tr>
+    {''.join(rows_html)}
+    </table>
+    </div>
+    """
+
+    st.markdown(heatmap_html, unsafe_allow_html=True)
+
+with tab_chart:
+    st.subheader(f"{symbol} price chart — top 5 strikes by volume")
+
+    chart_days = st.slider(
+        "Days of price history", min_value=30, max_value=365, value=90, step=10
+    )
+
+    @st.cache_data(ttl=300)
+    def get_cached_candles(sym: str, days: int):
+        from qt_chain import get_candles
+        return get_candles(sym, days=days)
+
+    try:
+        candles = get_cached_candles(symbol, chart_days)
+    except Exception as e:
+        candles = pd.DataFrame()
+        st.error(f"Couldn't load price history: {e}")
+
+    if not candles.empty:
+        import plotly.graph_objects as go
+
+        # Top 5 strikes by volume, across whichever expirations are currently
+        # selected in the strike-range filter above (this side: call or put).
+        top5 = (
+            df_filtered.groupby("strike")["volume"].sum()
+            .sort_values(ascending=False)
+            .head(5)
+        )
+
+        price_fig = go.Figure()
+        price_fig.add_trace(go.Candlestick(
+            x=candles["date"],
+            open=candles["open"],
+            high=candles["high"],
+            low=candles["low"],
+            close=candles["close"],
+            name=symbol,
+            increasing_line_color="#26a69a",
+            decreasing_line_color="#ef5350",
+        ))
+
+        line_colors = ["#f0b429", "#5b3aa0", "#26a69a", "#ef5350", "#42a5f5"]
+        for i, (strike, vol) in enumerate(top5.items()):
+            color = line_colors[i % len(line_colors)]
+            price_fig.add_hline(
+                y=strike,
+                line_dash="dash",
+                line_color=color,
+                line_width=1.5,
+                annotation_text=f"{strike:g} ({format_compact(vol)} vol)",
+                annotation_position="right",
+                annotation_font=dict(color=color, size=12),
+            )
+
+        if spot_price:
+            price_fig.add_hline(
+                y=spot_price,
+                line_dash="dot",
+                line_color="white",
+                line_width=1,
+                annotation_text=f"spot {spot_price:,.2f}",
+                annotation_position="left",
+                annotation_font=dict(color="white", size=11),
+            )
+
+        price_fig.update_layout(
+            height=600,
+            xaxis_rangeslider_visible=False,
+            plot_bgcolor="#1a1a1a",
+            paper_bgcolor="#1a1a1a",
+            font=dict(color="#ccc"),
+            margin=dict(l=10, r=80, t=20, b=10),
+        )
+        price_fig.update_xaxes(gridcolor="#333")
+        price_fig.update_yaxes(gridcolor="#333")
+
+        st.plotly_chart(price_fig, use_container_width=True)
+        st.caption(
+            f"Top 5 {option_side} strikes by volume (within currently selected "
+            f"strike range / expirations) overlaid as horizontal lines."
+        )
+    else:
+        st.info("No price history available for this symbol yet.")
+
+with tab_data:
+    df_filtered = df_side[
+        (df_side["strike"] >= strike_range[0]) & (df_side["strike"] <= strike_range[1])
+    ]
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Max-volume strike per expiration")
+        summary = max_volume_per_expiry(df)
+        summary_side = summary[summary["type"] == option_side].drop(columns=["type"])
+        st.dataframe(summary_side, use_container_width=True, hide_index=True)
+
+    with col2:
+        st.subheader("Top 10 by volume (this side)")
+        top10 = df_side.sort_values("volume", ascending=False).head(10)[
+            ["expiration", "strike", "volume", "openInterest"]
+        ]
+        st.dataframe(top10, use_container_width=True, hide_index=True)
+
+    with st.expander("Raw data for this snapshot", expanded=True):
+        st.dataframe(
+            df_side.sort_values(["expiration", "strike"]), use_container_width=True
+        )
