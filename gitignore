@@ -1,0 +1,10 @@
+# Never commit your live auth token or local database/snapshots —
+# these contain your Questrade session info and personal data.
+qt_token.json
+options_history.db
+*.csv
+snapshot_log.txt
+cron_test*.txt
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
