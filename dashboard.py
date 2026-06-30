@@ -292,7 +292,9 @@ def value_to_color(norm: float) -> str:
     return f"rgb({r},{g},{b})"
 
 
-tab_heatmap, tab_chart, tab_data = st.tabs(["📊 Heatmap", "📈 Chart", "🗂️ Data"])
+tab_heatmap, tab_chart, tab_exposure, tab_data = st.tabs(
+    ["📊 Heatmap", "📈 Chart", "⚡ Exposure", "🗂️ Data"]
+)
 
 with tab_heatmap:
     st.subheader(f"Volume heatmap — {symbol} {option_side}s")
@@ -495,6 +497,119 @@ with tab_chart:
         )
     else:
         st.info("No price history available for this symbol yet.")
+
+with tab_exposure:
+    from qt_exposure import compute_gex, compute_vex, detect_unusual_volume
+
+    df_for_exposure = df[
+        (df["strike"] >= strike_range[0]) & (df["strike"] <= strike_range[1])
+    ]
+
+    if not spot_price:
+        st.warning("Spot price unavailable — exposure calculations need it to run.")
+    else:
+        st.subheader(f"{symbol} Gamma Exposure (GEX)")
+        st.caption(
+            "Dollars of dealer hedging exposure per 1% move in the stock. "
+            "Calls shown positive (stabilizing), puts negative (destabilizing) "
+            "— the standard convention, based on open interest across both "
+            "calls and puts at each strike."
+        )
+
+        gex_df = compute_gex(df_for_exposure, spot_price)
+
+        if gex_df.empty:
+            st.info("No data in this strike range to compute exposure.")
+        else:
+            import plotly.graph_objects as go
+
+            gex_fig = go.Figure()
+            gex_fig.add_trace(go.Bar(
+                x=gex_df.index, y=gex_df["call_gex"],
+                name="Call GEX", marker_color="#26a69a",
+            ))
+            gex_fig.add_trace(go.Bar(
+                x=gex_df.index, y=gex_df["put_gex"],
+                name="Put GEX", marker_color="#ef5350",
+            ))
+            gex_fig.add_vline(
+                x=spot_price, line_dash="dot", line_color="white",
+                annotation_text=f"spot {spot_price:,.2f}",
+                annotation_font=dict(color="white"),
+            )
+            gex_fig.update_layout(
+                barmode="relative",
+                height=450,
+                plot_bgcolor="#1a1a1a",
+                paper_bgcolor="#1a1a1a",
+                font=dict(color="#ccc"),
+                xaxis_title="Strike",
+                yaxis_title="GEX ($)",
+                margin=dict(l=10, r=10, t=20, b=10),
+            )
+            gex_fig.update_xaxes(gridcolor="#333")
+            gex_fig.update_yaxes(gridcolor="#333")
+            st.plotly_chart(gex_fig, use_container_width=True)
+
+            net_gex_total = gex_df["net_gex"].sum()
+            gex_label = "net positive (stabilizing)" if net_gex_total >= 0 else "net negative (potentially volatile)"
+            st.metric("Total net GEX", f"${net_gex_total:,.0f}", help=gex_label)
+
+        st.divider()
+
+        st.subheader(f"{symbol} Vega Exposure (VEX)")
+        st.caption(
+            "Dollars of dealer exposure per 1-point move in implied volatility. "
+            "Shown as dealer-short convention (positive = dealers benefit "
+            "from falling IV)."
+        )
+
+        vex_df = compute_vex(df_for_exposure)
+
+        if vex_df.empty:
+            st.info("No data in this strike range to compute exposure.")
+        else:
+            vex_fig = go.Figure()
+            vex_fig.add_trace(go.Bar(
+                x=vex_df.index, y=vex_df["net_vex"],
+                name="Net VEX", marker_color="#42a5f5",
+            ))
+            vex_fig.add_vline(
+                x=spot_price, line_dash="dot", line_color="white",
+                annotation_text=f"spot {spot_price:,.2f}",
+                annotation_font=dict(color="white"),
+            )
+            vex_fig.update_layout(
+                height=400,
+                plot_bgcolor="#1a1a1a",
+                paper_bgcolor="#1a1a1a",
+                font=dict(color="#ccc"),
+                xaxis_title="Strike",
+                yaxis_title="VEX ($)",
+                margin=dict(l=10, r=10, t=20, b=10),
+            )
+            vex_fig.update_xaxes(gridcolor="#333")
+            vex_fig.update_yaxes(gridcolor="#333")
+            st.plotly_chart(vex_fig, use_container_width=True)
+
+    st.divider()
+
+    st.subheader(f"{symbol} Unusual Volume")
+    st.caption(
+        "Contracts where today's volume is at least 2x open interest — "
+        "the signature of a fresh position opening today rather than "
+        "ongoing activity in an already-established position."
+    )
+
+    unusual_df = detect_unusual_volume(df_for_exposure, min_volume=50)
+    if unusual_df.empty:
+        st.info("No unusual volume detected in this strike range right now.")
+    else:
+        st.dataframe(
+            unusual_df.rename(columns={"volume_oi_ratio": "volume/OI ratio"}),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 with tab_data:
     df_filtered = df_side[
