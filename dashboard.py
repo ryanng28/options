@@ -508,89 +508,167 @@ with tab_exposure:
     if not spot_price:
         st.warning("Spot price unavailable — exposure calculations need it to run.")
     else:
-        st.subheader(f"{symbol} Gamma Exposure (GEX)")
-        st.caption(
-            "Dollars of dealer hedging exposure per 1% move in the stock. "
-            "Calls shown positive (stabilizing), puts negative (destabilizing) "
-            "— the standard convention, based on open interest across both "
-            "calls and puts at each strike."
+        gex_or_vex = st.radio(
+            "Exposure type", ["GEX", "VEX"], horizontal=True, label_visibility="collapsed"
         )
 
-        gex_df = compute_gex(df_for_exposure, spot_price)
+        def signed_value_to_color(val: float, max_abs: float) -> str:
+            """Negative -> red gradient. Positive -> dark purple -> gold gradient.
+            Matches the Obsidian exposure heatmap color scheme."""
+            if max_abs == 0:
+                norm = 0
+            else:
+                norm = abs(val) / max_abs
+            norm = max(0.0, min(1.0, norm)) ** 0.6  # spread out lower values
 
-        if gex_df.empty:
+            if val < 0:
+                dark = (40, 14, 14)
+                bright = (220, 38, 38)
+                r = int(dark[0] + (bright[0] - dark[0]) * norm)
+                g = int(dark[1] + (bright[1] - dark[1]) * norm)
+                b = int(dark[2] + (bright[2] - dark[2]) * norm)
+            else:
+                dark = (24, 16, 36)
+                mid = (91, 58, 160)
+                gold = (245, 180, 66)
+                if norm < 0.5:
+                    t = norm / 0.5
+                    c1, c2 = dark, mid
+                else:
+                    t = (norm - 0.5) / 0.5
+                    c1, c2 = mid, gold
+                r = int(c1[0] + (c2[0] - c1[0]) * t)
+                g = int(c1[1] + (c2[1] - c1[1]) * t)
+                b = int(c1[2] + (c2[2] - c1[2]) * t)
+            return f"rgb({r},{g},{b})"
+
+        def format_money(v: float) -> str:
+            sign = "-" if v < 0 else ""
+            v = abs(v)
+            if v >= 1_000_000:
+                return f"{sign}${v/1_000_000:.1f}M"
+            if v >= 1_000:
+                return f"{sign}${v/1_000:.1f}K"
+            return f"{sign}${v:.0f}"
+
+        if gex_or_vex == "GEX":
+            exp_df = compute_gex(df_for_exposure, spot_price)
+            value_col = "net_gex"
+            title = "Gamma Exposure (GEX)"
+            subtitle = (
+                "Dollars of dealer hedging exposure per 1% move. Calls "
+                "positive (purple/gold = stabilizing), puts negative (red = "
+                "destabilizing)."
+            )
+        else:
+            exp_df = compute_vex(df_for_exposure)
+            value_col = "net_vex"
+            title = "Vega Exposure (VEX)"
+            subtitle = (
+                "Dollars of dealer exposure per 1-point move in implied "
+                "volatility. Dealer-short convention."
+            )
+
+        st.subheader(f"{symbol} {title}")
+        st.caption(subtitle)
+
+        if exp_df.empty:
             st.info("No data in this strike range to compute exposure.")
         else:
-            import plotly.graph_objects as go
+            strikes_desc = sorted(exp_df.index, reverse=True)
+            max_abs_val = exp_df[value_col].abs().max()
+            max_abs_val = max_abs_val if max_abs_val and max_abs_val > 0 else 1
+            most_extreme_strike = exp_df[value_col].abs().idxmax()
 
-            gex_fig = go.Figure()
-            gex_fig.add_trace(go.Bar(
-                x=gex_df.index, y=gex_df["call_gex"],
-                name="Call GEX", marker_color="#26a69a",
-            ))
-            gex_fig.add_trace(go.Bar(
-                x=gex_df.index, y=gex_df["put_gex"],
-                name="Put GEX", marker_color="#ef5350",
-            ))
-            gex_fig.add_vline(
-                x=spot_price, line_dash="dot", line_color="white",
-                annotation_text=f"spot {spot_price:,.2f}",
-                annotation_font=dict(color="white"),
-            )
-            gex_fig.update_layout(
-                barmode="relative",
-                height=450,
-                plot_bgcolor="#1a1a1a",
-                paper_bgcolor="#1a1a1a",
-                font=dict(color="#ccc"),
-                xaxis_title="Strike",
-                yaxis_title="GEX ($)",
-                margin=dict(l=10, r=10, t=20, b=10),
-            )
-            gex_fig.update_xaxes(gridcolor="#333")
-            gex_fig.update_yaxes(gridcolor="#333")
-            st.plotly_chart(gex_fig, use_container_width=True)
+            rows_html = []
+            spot_marker_inserted = False
 
-            net_gex_total = gex_df["net_gex"].sum()
-            gex_label = "net positive (stabilizing)" if net_gex_total >= 0 else "net negative (potentially volatile)"
-            st.metric("Total net GEX", f"${net_gex_total:,.0f}", help=gex_label)
+            for strike in strikes_desc:
+                if not spot_marker_inserted and strike < spot_price:
+                    spot_marker_inserted = True
+                    rows_html.append(
+                        f'<tr class="spot-row-exp"><td class="spot-label-exp">'
+                        f'SPOT {spot_price:,.2f}</td>'
+                        f'<td class="spot-line-exp"></td></tr>'
+                    )
 
-        st.divider()
+                val = exp_df.loc[strike, value_col]
+                color = signed_value_to_color(val, max_abs_val)
+                text = format_money(val)
+                highlight = " exp-highlight" if strike == most_extreme_strike else ""
 
-        st.subheader(f"{symbol} Vega Exposure (VEX)")
-        st.caption(
-            "Dollars of dealer exposure per 1-point move in implied volatility. "
-            "Shown as dealer-short convention (positive = dealers benefit "
-            "from falling IV)."
-        )
+                rows_html.append(
+                    f'<tr><td class="strike-label-exp">{strike:g}</td>'
+                    f'<td class="cell-exp"><div class="pill-exp{highlight}" '
+                    f'style="background:{color}">{text}</div></td></tr>'
+                )
 
-        vex_df = compute_vex(df_for_exposure)
+            exposure_html = f"""
+            <style>
+            .exp-wrap {{
+                background:#0d0d0d;
+                border-radius:8px;
+                padding:12px;
+                max-height:700px;
+                overflow-y:auto;
+            }}
+            .exp-table {{
+                border-collapse:separate;
+                border-spacing:0 3px;
+                width:100%;
+                font-family:monospace;
+            }}
+            .strike-label-exp {{
+                color:#999;
+                font-size:13px;
+                text-align:right;
+                padding-right:12px;
+                white-space:nowrap;
+                width:60px;
+            }}
+            .cell-exp {{
+                padding:0;
+            }}
+            .pill-exp {{
+                border-radius:4px;
+                padding:9px 14px;
+                color:white;
+                font-weight:700;
+                font-size:13px;
+                text-align:right;
+                white-space:nowrap;
+            }}
+            .exp-highlight {{
+                border:2px solid white;
+            }}
+            .spot-row-exp td {{
+                padding:3px 0;
+            }}
+            .spot-label-exp {{
+                color:#1a1a1a;
+                background:#fff;
+                font-size:11px;
+                font-weight:700;
+                text-align:right;
+                padding:2px 8px;
+                border-radius:4px;
+                white-space:nowrap;
+            }}
+            .spot-line-exp {{
+                border-top:2px dashed #f0d060;
+            }}
+            </style>
+            <div class="exp-wrap">
+            <table class="exp-table">
+            {''.join(rows_html)}
+            </table>
+            </div>
+            """
+            st.markdown(exposure_html, unsafe_allow_html=True)
 
-        if vex_df.empty:
-            st.info("No data in this strike range to compute exposure.")
-        else:
-            vex_fig = go.Figure()
-            vex_fig.add_trace(go.Bar(
-                x=vex_df.index, y=vex_df["net_vex"],
-                name="Net VEX", marker_color="#42a5f5",
-            ))
-            vex_fig.add_vline(
-                x=spot_price, line_dash="dot", line_color="white",
-                annotation_text=f"spot {spot_price:,.2f}",
-                annotation_font=dict(color="white"),
-            )
-            vex_fig.update_layout(
-                height=400,
-                plot_bgcolor="#1a1a1a",
-                paper_bgcolor="#1a1a1a",
-                font=dict(color="#ccc"),
-                xaxis_title="Strike",
-                yaxis_title="VEX ($)",
-                margin=dict(l=10, r=10, t=20, b=10),
-            )
-            vex_fig.update_xaxes(gridcolor="#333")
-            vex_fig.update_yaxes(gridcolor="#333")
-            st.plotly_chart(vex_fig, use_container_width=True)
+            net_total = exp_df[value_col].sum()
+            label = "net positive" if net_total >= 0 else "net negative"
+            st.metric(f"Total net {gex_or_vex}", format_money(net_total), help=label)
 
     st.divider()
 
