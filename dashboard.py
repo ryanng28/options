@@ -417,17 +417,52 @@ with tab_heatmap:
 with tab_chart:
     st.subheader(f"{symbol} price chart — top 5 strikes by volume")
 
+    # Interval selector — maps display label to Questrade interval enum + sensible default lookback
+    INTERVALS = {
+        "1m":  ("OneMinute",    1),
+        "5m":  ("FiveMinutes",  3),
+        "15m": ("FifteenMinutes", 7),
+        "1h":  ("OneHour",     30),
+        "4h":  ("FourHours",   60),
+        "1D":  ("OneDay",      90),
+    }
+
+    int_col1, int_col2, int_col3, int_col4, int_col5, int_col6 = st.columns(6)
+    interval_cols = [int_col1, int_col2, int_col3, int_col4, int_col5, int_col6]
+    labels = list(INTERVALS.keys())
+
+    if "chart_interval" not in st.session_state:
+        st.session_state["chart_interval"] = "1D"
+
+    for col, label in zip(interval_cols, labels):
+        with col:
+            is_active = st.session_state["chart_interval"] == label
+            if st.button(
+                label,
+                key=f"interval_{label}",
+                type="primary" if is_active else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state["chart_interval"] = label
+
+    selected_interval = st.session_state["chart_interval"]
+    qt_interval, default_days = INTERVALS[selected_interval]
+
     chart_days = st.slider(
-        "Days of price history", min_value=30, max_value=365, value=90, step=10
+        "Days of price history",
+        min_value=1,
+        max_value=365,
+        value=default_days,
+        step=1,
     )
 
-    @st.cache_data(ttl=300)
-    def get_cached_candles(sym: str, days: int):
+    @st.cache_data(ttl=60)
+    def get_cached_candles(sym: str, days: int, interval: str):
         from qt_chain import get_candles
-        return get_candles(sym, days=days)
+        return get_candles(sym, days=days, interval=interval)
 
     try:
-        candles = get_cached_candles(symbol, chart_days)
+        candles = get_cached_candles(symbol, chart_days, qt_interval)
     except Exception as e:
         candles = pd.DataFrame()
         st.error(f"Couldn't load price history: {e}")
