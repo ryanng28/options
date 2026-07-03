@@ -470,6 +470,12 @@ with tab_chart:
     if not candles.empty:
         import plotly.graph_objects as go
 
+        overlay_choice = st.radio(
+            "Overlay levels",
+            ["Top 5 volume strikes", "Top 5 GEX levels", "Both"],
+            horizontal=True,
+        )
+
         # Top 5 strikes by volume, across whichever expirations are currently
         # selected in the strike-range filter above (this side: call or put).
         top5 = (
@@ -490,18 +496,52 @@ with tab_chart:
             decreasing_line_color="#ef5350",
         ))
 
-        line_colors = ["#f0b429", "#5b3aa0", "#26a69a", "#ef5350", "#42a5f5"]
-        for i, (strike, vol) in enumerate(top5.items()):
-            color = line_colors[i % len(line_colors)]
-            price_fig.add_hline(
-                y=strike,
-                line_dash="dash",
-                line_color=color,
-                line_width=1.5,
-                annotation_text=f"{strike:g} ({format_compact(vol)} vol)",
-                annotation_position="right",
-                annotation_font=dict(color=color, size=12),
+        def fmt_money_chart(v: float) -> str:
+            sign = "-" if v < 0 else ""
+            av = abs(v)
+            if av >= 1_000_000:
+                return f"{sign}${av/1_000_000:.1f}M"
+            if av >= 1_000:
+                return f"{sign}${av/1_000:.1f}K"
+            return f"{sign}${av:.0f}"
+
+        if overlay_choice in ("Top 5 volume strikes", "Both"):
+            line_colors = ["#f0b429", "#5b3aa0", "#26a69a", "#ef5350", "#42a5f5"]
+            for i, (strike, vol) in enumerate(top5.items()):
+                color = line_colors[i % len(line_colors)]
+                price_fig.add_hline(
+                    y=strike,
+                    line_dash="dash",
+                    line_color=color,
+                    line_width=1.5,
+                    annotation_text=f"{strike:g} ({format_compact(vol)} vol)",
+                    annotation_position="right",
+                    annotation_font=dict(color=color, size=12),
+                )
+
+        if overlay_choice in ("Top 5 GEX levels", "Both") and spot_price:
+            from qt_exposure import compute_gex
+
+            chart_gex = compute_gex(
+                df[(df["strike"] >= strike_range[0]) & (df["strike"] <= strike_range[1])],
+                spot_price,
             )
+            if not chart_gex.empty:
+                top_gex = chart_gex["net_gex"].abs().sort_values(ascending=False).head(5)
+                for strike in top_gex.index:
+                    net_val = chart_gex.loc[strike, "net_gex"]
+                    # Positive GEX = support/magnet (gold), negative = volatile zone (red)
+                    color = "#f0b429" if net_val >= 0 else "#ef5350"
+                    price_fig.add_hline(
+                        y=strike,
+                        line_dash="solid",
+                        line_color=color,
+                        line_width=1.5,
+                        opacity=0.8,
+                        annotation_text=f"{strike:g} GEX {fmt_money_chart(net_val)}",
+                        annotation_position="left",
+                        annotation_font=dict(color=color, size=11),
+                    )
 
         if spot_price:
             price_fig.add_hline(
@@ -520,15 +560,16 @@ with tab_chart:
             plot_bgcolor="#1a1a1a",
             paper_bgcolor="#1a1a1a",
             font=dict(color="#ccc"),
-            margin=dict(l=10, r=80, t=20, b=10),
+            margin=dict(l=80, r=80, t=20, b=10),
         )
         price_fig.update_xaxes(gridcolor="#333")
         price_fig.update_yaxes(gridcolor="#333")
 
         st.plotly_chart(price_fig, use_container_width=True)
         st.caption(
-            f"Top 5 {option_side} strikes by volume (within currently selected "
-            f"strike range / expirations) overlaid as horizontal lines."
+            "Dashed lines = top volume strikes (right labels). Solid lines = "
+            "largest net GEX strikes (left labels): gold = positive GEX "
+            "(price magnet/stabilizing), red = negative GEX (volatile zone)."
         )
     else:
         st.info("No price history available for this symbol yet.")
@@ -543,9 +584,17 @@ with tab_exposure:
     if not spot_price:
         st.warning("Spot price unavailable — exposure calculations need it to run.")
     else:
-        gex_or_vex = st.radio(
-            "Exposure type", ["GEX", "VEX"], horizontal=True, label_visibility="collapsed"
-        )
+        exp_col1, exp_col2 = st.columns(2)
+        with exp_col1:
+            gex_or_vex = st.radio(
+                "Exposure type", ["GEX", "VEX"], horizontal=True, label_visibility="collapsed"
+            )
+        with exp_col2:
+            weight_choice = st.radio(
+                "Weight by", ["Open Interest", "Today's Volume"],
+                horizontal=True, label_visibility="collapsed",
+            )
+        weight_by = "openInterest" if weight_choice == "Open Interest" else "volume"
 
         def signed_value_to_color(val: float, max_abs: float) -> str:
             """Negative -> red gradient. Positive -> dark purple -> gold gradient.
@@ -587,21 +636,27 @@ with tab_exposure:
             return f"{sign}${v:.0f}"
 
         if gex_or_vex == "GEX":
-            exp_df = compute_gex(df_for_exposure, spot_price)
+            exp_df = compute_gex(df_for_exposure, spot_price, weight_by=weight_by)
             value_col = "net_gex"
+            call_col, put_col = "call_gex", "put_gex"
             title = "Gamma Exposure (GEX)"
             subtitle = (
                 "Dollars of dealer hedging exposure per 1% move. Calls "
                 "positive (purple/gold = stabilizing), puts negative (red = "
-                "destabilizing)."
+                "destabilizing). "
+                + ("Weighted by open interest (held positioning)." if weight_by == "openInterest"
+                   else "Weighted by TODAY'S VOLUME (live flow, resets daily).")
             )
         else:
-            exp_df = compute_vex(df_for_exposure)
+            exp_df = compute_vex(df_for_exposure, weight_by=weight_by)
             value_col = "net_vex"
+            call_col, put_col = "call_vex", "put_vex"
             title = "Vega Exposure (VEX)"
             subtitle = (
                 "Dollars of dealer exposure per 1-point move in implied "
-                "volatility. Dealer-short convention."
+                "volatility. Dealer-short convention. "
+                + ("Weighted by open interest (held positioning)." if weight_by == "openInterest"
+                   else "Weighted by TODAY'S VOLUME (live flow, resets daily).")
             )
 
         st.subheader(f"{symbol} {title}")
@@ -611,11 +666,20 @@ with tab_exposure:
             st.info("No data in this strike range to compute exposure.")
         else:
             strikes_desc = sorted(exp_df.index, reverse=True)
-            max_abs_val = exp_df[value_col].abs().max()
+            max_abs_val = max(
+                exp_df[call_col].abs().max(),
+                exp_df[put_col].abs().max(),
+                exp_df[value_col].abs().max(),
+            )
             max_abs_val = max_abs_val if max_abs_val and max_abs_val > 0 else 1
             most_extreme_strike = exp_df[value_col].abs().idxmax()
 
-            rows_html = []
+            rows_html = [
+                '<tr><th class="exp-header-cell"></th>'
+                '<th class="exp-header-cell">CALL</th>'
+                '<th class="exp-header-cell">PUT</th>'
+                '<th class="exp-header-cell">NET</th></tr>'
+            ]
             spot_marker_inserted = False
 
             for strike in strikes_desc:
@@ -624,19 +688,23 @@ with tab_exposure:
                     rows_html.append(
                         f'<tr class="spot-row-exp"><td class="spot-label-exp">'
                         f'SPOT {spot_price:,.2f}</td>'
-                        f'<td class="spot-line-exp"></td></tr>'
+                        f'<td class="spot-line-exp" colspan="3"></td></tr>'
                     )
 
-                val = exp_df.loc[strike, value_col]
-                color = signed_value_to_color(val, max_abs_val)
-                text = format_money(val)
+                call_val = exp_df.loc[strike, call_col]
+                put_val = exp_df.loc[strike, put_col]
+                net_val = exp_df.loc[strike, value_col]
                 highlight = " exp-highlight" if strike == most_extreme_strike else ""
 
-                rows_html.append(
-                    f'<tr><td class="strike-label-exp">{strike:g}</td>'
-                    f'<td class="cell-exp"><div class="pill-exp{highlight}" '
-                    f'style="background:{color}">{text}</div></td></tr>'
-                )
+                cells = [f'<td class="strike-label-exp">{strike:g}</td>']
+                for i, v in enumerate((call_val, put_val, net_val)):
+                    color = signed_value_to_color(v, max_abs_val)
+                    hl = highlight if i == 2 else ""  # highlight only the NET cell
+                    cells.append(
+                        f'<td class="cell-exp"><div class="pill-exp{hl}" '
+                        f'style="background:{color}">{format_money(v)}</div></td>'
+                    )
+                rows_html.append(f"<tr>{''.join(cells)}</tr>")
 
             exposure_html = f"""
             <style>
@@ -652,6 +720,14 @@ with tab_exposure:
                 border-spacing:0 3px;
                 width:100%;
                 font-family:monospace;
+            }}
+            .exp-header-cell {{
+                color:#888;
+                font-size:11px;
+                font-weight:700;
+                text-align:center;
+                padding:4px 8px;
+                letter-spacing:1px;
             }}
             .strike-label-exp {{
                 color:#999;

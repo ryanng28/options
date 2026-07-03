@@ -35,17 +35,21 @@ from __future__ import annotations
 import pandas as pd
 
 
-def compute_gex(df: pd.DataFrame, spot_price: float) -> pd.DataFrame:
-    """Given a chain DataFrame (with strike, type, gamma, openInterest
-    columns) and the current spot price, returns a DataFrame with one row
-    per strike showing call GEX, put GEX, and net GEX in dollars.
+def compute_gex(df: pd.DataFrame, spot_price: float, weight_by: str = "openInterest") -> pd.DataFrame:
+    """Given a chain DataFrame (with strike, type, gamma columns) and the
+    current spot price, returns a DataFrame with one row per strike showing
+    call GEX, put GEX, and net GEX in dollars.
+
+    weight_by: "openInterest" (default, standard GEX — positioning that's
+    actually held) or "volume" (today's traded volume — what's flowing
+    TODAY, more of a live-activity view than a positioning view).
     """
     work = df.copy()
     work["gamma"] = work["gamma"].fillna(0)
-    work["openInterest"] = work["openInterest"].fillna(0)
+    work[weight_by] = work[weight_by].fillna(0)
 
     work["gex_raw"] = (
-        work["gamma"] * work["openInterest"] * 100 * (spot_price ** 2) * 0.01
+        work["gamma"] * work[weight_by] * 100 * (spot_price ** 2) * 0.01
     )
     # Calls are positive exposure, puts are negative (standard convention)
     work["gex_signed"] = work.apply(
@@ -66,17 +70,19 @@ def compute_gex(df: pd.DataFrame, spot_price: float) -> pd.DataFrame:
     return pivot.sort_index()
 
 
-def compute_vex(df: pd.DataFrame) -> pd.DataFrame:
-    """Given a chain DataFrame (with strike, type, vega, openInterest
-    columns), returns a DataFrame with one row per strike showing call VEX,
-    put VEX, and net VEX. Dealers assumed net short options overall, so we
-    negate to represent dealer vega exposure (positive = dealers gain as
-    IV falls, i.e. they're short vega here)."""
+def compute_vex(df: pd.DataFrame, weight_by: str = "openInterest") -> pd.DataFrame:
+    """Given a chain DataFrame (with strike, type, vega columns), returns a
+    DataFrame with one row per strike showing call VEX, put VEX, and net VEX.
+    Dealers assumed net short options overall, so we negate to represent
+    dealer vega exposure.
+
+    weight_by: "openInterest" (default) or "volume" (today's flow).
+    """
     work = df.copy()
     work["vega"] = work["vega"].fillna(0)
-    work["openInterest"] = work["openInterest"].fillna(0)
+    work[weight_by] = work[weight_by].fillna(0)
 
-    work["vex_raw"] = -(work["vega"] * work["openInterest"] * 100)
+    work["vex_raw"] = -(work["vega"] * work[weight_by] * 100)
 
     pivot = work.pivot_table(
         index="strike", columns="type", values="vex_raw", aggfunc="sum"
