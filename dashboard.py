@@ -472,7 +472,7 @@ with tab_chart:
 
         overlay_choice = st.radio(
             "Overlay levels",
-            ["Top 5 volume strikes", "Top 5 GEX levels", "Both"],
+            ["Top 5 volume strikes", "GEX bands", "VEX bands", "Volume + GEX bands"],
             horizontal=True,
         )
 
@@ -505,7 +505,7 @@ with tab_chart:
                 return f"{sign}${av/1_000:.1f}K"
             return f"{sign}${av:.0f}"
 
-        if overlay_choice in ("Top 5 volume strikes", "Both"):
+        if overlay_choice in ("Top 5 volume strikes", "Volume + GEX bands"):
             line_colors = ["#f0b429", "#5b3aa0", "#26a69a", "#ef5350", "#42a5f5"]
             for i, (strike, vol) in enumerate(top5.items()):
                 color = line_colors[i % len(line_colors)]
@@ -519,28 +519,66 @@ with tab_chart:
                     annotation_font=dict(color=color, size=12),
                 )
 
-        if overlay_choice in ("Top 5 GEX levels", "Both") and spot_price:
-            from qt_exposure import compute_gex
+        if overlay_choice in ("GEX bands", "VEX bands", "Volume + GEX bands") and spot_price:
+            from qt_exposure import compute_gex, compute_vex
 
-            chart_gex = compute_gex(
-                df[(df["strike"] >= strike_range[0]) & (df["strike"] <= strike_range[1])],
-                spot_price,
-            )
+            band_df_source = df[
+                (df["strike"] >= strike_range[0]) & (df["strike"] <= strike_range[1])
+            ]
+            if overlay_choice == "VEX bands":
+                chart_gex = compute_vex(band_df_source)
+                band_value_col = "net_vex"
+            else:
+                chart_gex = compute_gex(band_df_source, spot_price)
+                band_value_col = "net_gex"
+
             if not chart_gex.empty:
-                top_gex = chart_gex["net_gex"].abs().sort_values(ascending=False).head(5)
-                for strike in top_gex.index:
-                    net_val = chart_gex.loc[strike, "net_gex"]
-                    # Positive GEX = support/magnet (gold), negative = volatile zone (red)
-                    color = "#f0b429" if net_val >= 0 else "#ef5350"
-                    price_fig.add_hline(
-                        y=strike,
-                        line_dash="solid",
-                        line_color=color,
-                        line_width=1.5,
-                        opacity=0.8,
-                        annotation_text=f"{strike:g} GEX {fmt_money_chart(net_val)}",
-                        annotation_position="left",
-                        annotation_font=dict(color=color, size=11),
+                # Night Vision style: every strike renders as a full-width
+                # horizontal band behind the candles, colored by its net GEX
+                # (dark purple -> purple -> gold for positive, red for negative).
+                strikes_sorted_chart = sorted(chart_gex.index)
+                max_abs_gex = chart_gex[band_value_col].abs().max()
+                max_abs_gex = max_abs_gex if max_abs_gex and max_abs_gex > 0 else 1
+
+                def gex_band_color(val: float) -> str:
+                    norm = min(1.0, abs(val) / max_abs_gex) ** 0.6
+                    if val < 0:
+                        dark, bright = (40, 10, 10), (200, 30, 30)
+                        r = int(dark[0] + (bright[0] - dark[0]) * norm)
+                        g = int(dark[1] + (bright[1] - dark[1]) * norm)
+                        b = int(dark[2] + (bright[2] - dark[2]) * norm)
+                    else:
+                        dark, mid, gold = (25, 15, 40), (130, 40, 200), (245, 180, 66)
+                        if norm < 0.5:
+                            t = norm / 0.5
+                            c1, c2 = dark, mid
+                        else:
+                            t = (norm - 0.5) / 0.5
+                            c1, c2 = mid, gold
+                        r = int(c1[0] + (c2[0] - c1[0]) * t)
+                        g = int(c1[1] + (c2[1] - c1[1]) * t)
+                        b = int(c1[2] + (c2[2] - c1[2]) * t)
+                    return f"rgb({r},{g},{b})"
+
+                # Band edges: halfway to the neighboring strike on each side
+                for i, strike in enumerate(strikes_sorted_chart):
+                    lower_gap = (
+                        (strike - strikes_sorted_chart[i - 1]) / 2 if i > 0
+                        else (strikes_sorted_chart[i + 1] - strike) / 2
+                        if len(strikes_sorted_chart) > 1 else 0.5
+                    )
+                    upper_gap = (
+                        (strikes_sorted_chart[i + 1] - strike) / 2
+                        if i < len(strikes_sorted_chart) - 1 else lower_gap
+                    )
+                    val = chart_gex.loc[strike, band_value_col]
+                    price_fig.add_hrect(
+                        y0=strike - lower_gap * 0.85,
+                        y1=strike + upper_gap * 0.85,
+                        fillcolor=gex_band_color(val),
+                        opacity=0.55,
+                        layer="below",
+                        line_width=0,
                     )
 
         if spot_price:
@@ -567,9 +605,9 @@ with tab_chart:
 
         st.plotly_chart(price_fig, use_container_width=True)
         st.caption(
-            "Dashed lines = top volume strikes (right labels). Solid lines = "
-            "largest net GEX strikes (left labels): gold = positive GEX "
-            "(price magnet/stabilizing), red = negative GEX (volatile zone)."
+            "Bands: purple → gold = increasingly positive exposure (price "
+            "magnet/stabilizing), red = negative exposure (volatile zone). "
+            "Dashed lines = top volume strikes."
         )
     else:
         st.info("No price history available for this symbol yet.")
